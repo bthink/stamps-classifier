@@ -954,6 +954,51 @@ def fallback_single_box(source_path: Path) -> list[tuple[int, int, int, int]]:
     return [(0, 0, max(1, width), max(1, height))]
 
 
+def is_full_image_box(
+    bbox: tuple[int, int, int, int] | None,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    if bbox is None:
+        return True
+    x, y, w, h = bbox
+    return x <= 0 and y <= 0 and w >= image_width and h >= image_height
+
+
+def make_crop_file(
+    source_path: Path,
+    source_hash: str,
+    bbox: tuple[int, int, int, int],
+    crop_label: str,
+) -> Path:
+    x, y, w, h = bbox
+    ext = source_path.suffix.lower()
+    if ext in {".jpg", ".jpeg"}:
+        out_ext = ".jpg"
+        fmt = "JPEG"
+    elif ext == ".png":
+        out_ext = ".png"
+        fmt = "PNG"
+    else:
+        out_ext = ".jpg"
+        fmt = "JPEG"
+
+    crop_name = (
+        f"{safe_ascii(source_path.stem, fallback='source')}"
+        f"__{crop_label}_{source_hash[:8]}{out_ext}"
+    )
+    crop_path = CROPS_DIR / crop_name
+
+    with Image.open(source_path) as image:
+        cropped = image.crop((x, y, x + w, y + h))
+        if fmt == "JPEG":
+            cropped = cropped.convert("RGB")
+            cropped.save(crop_path, format=fmt, quality=95)
+        else:
+            cropped.save(crop_path, format=fmt)
+    return crop_path
+
+
 def detect_stamp_boxes(
     source_path: Path,
     source_hash: str,
@@ -1034,35 +1079,54 @@ def build_stamp_candidates(
 ) -> list[dict[str, Any]]:
     if len(boxes) <= 1:
         bbox = boxes[0] if boxes else None
+        with Image.open(source_path) as image:
+            width, height = image.size
+        use_crop = bbox is not None and not is_full_image_box(bbox, width, height)
+        if use_crop and bbox is not None:
+            crop_path = make_crop_file(
+                source_path=source_path,
+                source_hash=source_hash,
+                bbox=bbox,
+                crop_label="single",
+            )
+            analysis_path = crop_path
+            output_image_path = crop_path
+        else:
+            analysis_path = source_path
+            output_image_path = source_path
         return [
             {
-                "analysis_path": source_path,
+                "analysis_path": analysis_path,
+                "output_image_path": output_image_path,
                 "source_image": source_path.name,
                 "crop_index": 1,
                 "crop_bbox": bbox,
                 "is_multi": False,
+                "should_rename_source": True,
+                "is_single_cropped": use_crop,
             }
         ]
 
     candidates: list[dict[str, Any]] = []
-    with Image.open(source_path) as image:
-        for index, (x, y, w, h) in enumerate(boxes, start=1):
-            crop = image.crop((x, y, x + w, y + h)).convert("RGB")
-            crop_name = (
-                f"{safe_ascii(source_path.stem, fallback='source')}"
-                f"__s{index:02d}_{source_hash[:8]}.jpg"
-            )
-            crop_path = CROPS_DIR / crop_name
-            crop.save(crop_path, format="JPEG", quality=95)
-            candidates.append(
-                {
-                    "analysis_path": crop_path,
-                    "source_image": source_path.name,
-                    "crop_index": index,
-                    "crop_bbox": (x, y, w, h),
-                    "is_multi": True,
-                }
-            )
+    for index, bbox in enumerate(boxes, start=1):
+        crop_path = make_crop_file(
+            source_path=source_path,
+            source_hash=source_hash,
+            bbox=bbox,
+            crop_label=f"s{index:02d}",
+        )
+        candidates.append(
+            {
+                "analysis_path": crop_path,
+                "output_image_path": crop_path,
+                "source_image": source_path.name,
+                "crop_index": index,
+                "crop_bbox": bbox,
+                "is_multi": True,
+                "should_rename_source": False,
+                "is_single_cropped": False,
+            }
+        )
     return candidates
 
 
@@ -1150,10 +1214,13 @@ def process_images(args: argparse.Namespace) -> int:
 
         for candidate in candidates:
             analysis_path = candidate["analysis_path"]
+            output_image_path = candidate["output_image_path"]
             source_image = str(candidate["source_image"])
             crop_index = int(candidate["crop_index"])
             crop_bbox = candidate.get("crop_bbox")
             is_multi = bool(candidate.get("is_multi"))
+            should_rename_source = bool(candidate.get("should_rename_source"))
+            is_single_cropped = bool(candidate.get("is_single_cropped"))
             candidate_name = analysis_path.name
 
             try:
@@ -1212,28 +1279,31 @@ def process_images(args: argparse.Namespace) -> int:
                         )
                     else:
                         data = normalize_response(cached_data)
-                        if is_multi:
+                        if not should_rename_source:
                             output_filename = build_target_filename(
                                 analysis_path, data, file_hash
                             )
-                            output_source_path = analysis_path
+                            output_source_path = output_image_path
                         else:
                             target_filename = build_target_filename(
                                 source_path, data, file_hash
                             )
                             target_path = INPUT_DIR / target_filename
                             target_path = make_unique_path(target_path, source_path)
-                            output_source_path = source_path
+                            output_source_path = output_image_path
                             output_filename = source_path.name
                             if target_path != source_path:
                                 try:
                                     source_path.rename(target_path)
-                                    output_source_path = target_path
                                     output_filename = target_path.name
                                     source_path = target_path
                                     print(f"-> renamed to {output_filename}")
                                 except Exception as exc:
                                     print(f"Error renaming {source_path.name}: {exc}")
+                            if not is_single_cropped:
+                                output_source_path = source_path
+                        if is_single_cropped:
+                            print(f"-> single stamp crop used for output: {output_image_path.name}")
 
                         listing_entry = format_listing_entry(
                             output_filename,
@@ -1316,28 +1386,31 @@ def process_images(args: argparse.Namespace) -> int:
                         )
                     else:
                         data = normalize_response(cached_data)
-                        if is_multi:
+                        if not should_rename_source:
                             output_filename = build_target_filename(
                                 analysis_path, data, file_hash
                             )
-                            output_source_path = analysis_path
+                            output_source_path = output_image_path
                         else:
                             target_filename = build_target_filename(
                                 source_path, data, file_hash
                             )
                             target_path = INPUT_DIR / target_filename
                             target_path = make_unique_path(target_path, source_path)
-                            output_source_path = source_path
+                            output_source_path = output_image_path
                             output_filename = source_path.name
                             if target_path != source_path:
                                 try:
                                     source_path.rename(target_path)
-                                    output_source_path = target_path
                                     output_filename = target_path.name
                                     source_path = target_path
                                     print(f"-> renamed to {output_filename}")
                                 except Exception as exc:
                                     print(f"Error renaming {source_path.name}: {exc}")
+                            if not is_single_cropped:
+                                output_source_path = source_path
+                        if is_single_cropped:
+                            print(f"-> single stamp crop used for output: {output_image_path.name}")
 
                         listing_entry = format_listing_entry(
                             output_filename,
@@ -1487,20 +1560,19 @@ def process_images(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            if is_multi:
+            if not should_rename_source:
                 output_filename = build_target_filename(analysis_path, data, file_hash)
-                output_source_path = analysis_path
+                output_source_path = output_image_path
                 print(f"-> classified segment {crop_index} as {output_filename}")
             else:
                 target_filename = build_target_filename(source_path, data, file_hash)
                 target_path = INPUT_DIR / target_filename
                 target_path = make_unique_path(target_path, source_path)
-                output_source_path = source_path
+                output_source_path = output_image_path
                 output_filename = source_path.name
                 if target_path != source_path:
                     try:
                         source_path.rename(target_path)
-                        output_source_path = target_path
                         output_filename = target_path.name
                         source_path = target_path
                         print(f"-> renamed to {output_filename}")
@@ -1508,6 +1580,10 @@ def process_images(args: argparse.Namespace) -> int:
                         print(f"Error renaming {source_path.name}: {exc}")
                 else:
                     print(f"-> filename unchanged: {output_filename}")
+                if not is_single_cropped:
+                    output_source_path = source_path
+                if is_single_cropped:
+                    print(f"-> single stamp crop used for output: {output_image_path.name}")
 
             listing_entry = format_listing_entry(
                 output_filename,
