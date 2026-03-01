@@ -5,6 +5,7 @@ import argparse
 import base64
 import csv
 from datetime import datetime, timezone
+import html
 import hashlib
 import json
 import os
@@ -34,7 +35,6 @@ try:
     import openai as openai_module
 except Exception:
     openai_module = None
-
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
@@ -646,7 +646,6 @@ def format_listing_entry(
     condition = CONDITION_TO_PL.get(
         str(data.get("condition") or "unknown"), "nieznany"
     )
-
     lines = [
         f"=== {filename} ===",
         "",
@@ -1153,6 +1152,167 @@ def write_stamp_output(
         print(f"Error writing output package for {image_path.name}: {exc}")
 
 
+def find_output_record_dir(output_filename: str) -> Path | None:
+    for item in sorted(OUTPUT_DIR.iterdir()):
+        if not item.is_dir():
+            continue
+        if (item / output_filename).exists():
+            return item
+    return None
+
+
+def relpath_from_output(path: Path) -> str:
+    return path.relative_to(OUTPUT_DIR).as_posix()
+
+
+def render_catalog_html(rows: list[dict[str, str]]) -> str:
+    hidden_headers = {"nazwa_pliku", "zrodlo_obrazu", "bbox"}
+    visible_headers = [h for h in CSV_HEADERS_PL if h not in hidden_headers]
+    table_header = (
+        "<tr><th>zdjecie</th>"
+        + "".join(f"<th>{html.escape(h)}</th>" for h in visible_headers)
+        + "</tr>"
+    )
+
+    table_rows: list[str] = []
+    for row in rows:
+        output_filename = str(row.get("nazwa_pliku") or "")
+        record_dir = find_output_record_dir(output_filename)
+
+        image_cell = "<td>brak</td>"
+        if record_dir is not None:
+            image_path = record_dir / output_filename
+            if image_path.exists():
+                image_rel = relpath_from_output(image_path)
+                image_alt = html.escape(output_filename)
+                image_cell = (
+                    f'<td><a href="{image_rel}">'
+                    f'<img src="{image_rel}" alt="{image_alt}" loading="lazy"></a></td>'
+                )
+
+        values = "".join(
+            f"<td>{html.escape(str(row.get(header) or ''))}</td>"
+            for header in visible_headers
+        )
+        table_rows.append(f"<tr>{image_cell}{values}</tr>")
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"""<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Katalog znaczkow</title>
+  <style>
+    :root {{
+      --bg: #f5f3ef;
+      --fg: #1f2a33;
+      --muted: #5c6b78;
+      --line: #d6d2ca;
+      --accent: #244f7d;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #faf8f4 0%, var(--bg) 100%);
+      color: var(--fg);
+    }}
+    .wrap {{
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px 16px 36px;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 28px;
+    }}
+    p {{
+      margin: 0 0 20px;
+      color: var(--muted);
+    }}
+    .table-wrap {{
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 8px 24px rgba(25, 35, 46, 0.08);
+    }}
+    table {{
+      border-collapse: collapse;
+      min-width: 980px;
+      width: 100%;
+      font-size: 14px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      padding: 10px 12px;
+    }}
+    th:last-child, td:last-child {{
+      border-right: none;
+    }}
+    tr:last-child td {{
+      border-bottom: none;
+    }}
+    th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f1efe9;
+      color: #203247;
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }}
+    td img {{
+      display: block;
+      width: 120px;
+      max-width: 120px;
+      height: auto;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }}
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Katalog znaczkow</h1>
+    <p>Wygenerowano: {generated_at}</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          {table_header}
+        </thead>
+        <tbody>
+          {''.join(table_rows)}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+def generate_static_catalog(rows: list[dict[str, str]]) -> None:
+    try:
+        html_content = render_catalog_html(rows)
+        (OUTPUT_DIR / "index.html").write_text(html_content, encoding="utf-8")
+        print("-> generated static catalog: output/index.html")
+    except Exception as exc:
+        print(f"Error generating static catalog: {exc}")
+
+
 def process_images(args: argparse.Namespace) -> int:
     ensure_directories()
     convert_heic_files()
@@ -1621,6 +1781,7 @@ def process_images(args: argparse.Namespace) -> int:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
         writer.writeheader()
         writer.writerows(csv_rows)
+    generate_static_catalog(csv_rows)
 
     save_cache(cache)
     save_processed_index(processed_index)

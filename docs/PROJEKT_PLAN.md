@@ -23,12 +23,15 @@
 - `cache/hash.json` - cache odpowiedzi modelu
 - `cache/processed_index.json` - indeks przetworzonych plikow i statusow
 - `cache/detection.json` - cache wykrytych bbox dla zdjec zrodlowych
+9. Program generuje statyczna strone katalogu:
+- `output/index.html` (tabela: zdjecie, opis i pozostale kolumny)
 
 ### 1.3 Aktualna struktura projektu
 - `process_stamps.py` - glowny pipeline.
 - `input/` - zdjecia wejsciowe.
 - `input/original_heic/` - oryginalne pliki HEIC po konwersji.
 - `output/listings.csv` - zbiorczy CSV.
+- `output/index.html` - statyczny katalog do publikacji.
 - `output/<folder_znaczka>/opis.txt` - opis pojedynczego znaczka.
 - `output/<folder_znaczka>/<zdjecie>` - kopia zdjecia powiazana z opisem.
 - `cache/hash.json` - cache AI po hashu obrazu.
@@ -88,6 +91,7 @@ python3 process_stamps.py --single-stamp-only
 
 ### 2.4 Wyniki
 - `output/listings.csv` - zbiorczy plik do dalszej pracy/importu.
+- `output/index.html` - gotowa statyczna strona z tabela wynikow.
 - `output/<id_znaczka>/opis.txt` - opis pojedynczego znaczka.
 - `output/<id_znaczka>/<zdjecie>` - kopia powiazanego obrazu.
 
