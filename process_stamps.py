@@ -557,9 +557,32 @@ def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def prepare_output_stamp_dirs() -> None:
+    for item in OUTPUT_DIR.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+
+
+def write_stamp_output(image_path: Path, listing_text: str) -> None:
+    try:
+        folder_base = safe_ascii(image_path.stem, fallback="znaczek")
+        target_dir = OUTPUT_DIR / folder_base
+        counter = 2
+        while target_dir.exists():
+            target_dir = OUTPUT_DIR / f"{folder_base}_{counter}"
+            counter += 1
+
+        target_dir.mkdir(parents=True, exist_ok=False)
+        (target_dir / "opis.txt").write_text(listing_text, encoding="utf-8")
+        shutil.copy2(image_path, target_dir / image_path.name)
+    except Exception as exc:
+        print(f"Error writing output package for {image_path.name}: {exc}")
+
+
 def process_images() -> int:
     ensure_directories()
     convert_heic_files()
+    prepare_output_stamp_dirs()
 
     cache = load_cache()
     client = get_openai_client()
@@ -579,14 +602,12 @@ def process_images() -> int:
 
     input_files = sorted(p for p in INPUT_DIR.iterdir() if should_process_file(p))
     if not input_files:
-        print("No files to process in stamps/input/")
-        (OUTPUT_DIR / "listings.txt").write_text("", encoding="utf-8")
+        print("No files to process in input/")
         with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
             writer.writeheader()
         return 0
 
-    listing_text_entries: list[str] = []
     csv_rows: list[dict[str, str]] = []
 
     for image_path in input_files:
@@ -595,7 +616,8 @@ def process_images() -> int:
             file_hash = sha1_of_file(image_path)
         except Exception as exc:
             print(f"Error hashing file {image_path.name}: {exc}")
-            listing_text_entries.append(failed_listing_entry(image_path.name))
+            failed_entry = failed_listing_entry(image_path.name)
+            write_stamp_output(image_path, failed_entry)
             csv_rows.append(failed_csv_row(image_path.name))
             continue
 
@@ -603,7 +625,8 @@ def process_images() -> int:
         if data is None:
             if client is None:
                 print(f"Error: cannot analyze {image_path.name} without OpenAI client and cache.")
-                listing_text_entries.append(failed_listing_entry(image_path.name))
+                failed_entry = failed_listing_entry(image_path.name)
+                write_stamp_output(image_path, failed_entry)
                 csv_rows.append(failed_csv_row(image_path.name))
                 continue
 
@@ -612,7 +635,8 @@ def process_images() -> int:
                 cache[file_hash] = data
             except Exception as exc:
                 print(f"Error analyzing {image_path.name}: {exc}")
-                listing_text_entries.append(failed_listing_entry(image_path.name))
+                failed_entry = failed_listing_entry(image_path.name)
+                write_stamp_output(image_path, failed_entry)
                 csv_rows.append(failed_csv_row(image_path.name))
                 continue
         else:
@@ -620,7 +644,8 @@ def process_images() -> int:
 
         if not is_recognized(data):
             print(f"-> FAILED recognition for {image_path.name}")
-            listing_text_entries.append(failed_listing_entry(image_path.name))
+            failed_entry = failed_listing_entry(image_path.name)
+            write_stamp_output(image_path, failed_entry)
             csv_rows.append(failed_csv_row(image_path.name))
             continue
 
@@ -639,13 +664,9 @@ def process_images() -> int:
         else:
             print(f"-> filename unchanged: {final_path.name}")
 
-        listing_text_entries.append(format_listing_entry(final_path.name, data))
+        listing_entry = format_listing_entry(final_path.name, data)
+        write_stamp_output(final_path, listing_entry)
         csv_rows.append(success_csv_row(final_path.name, data))
-
-    (OUTPUT_DIR / "listings.txt").write_text(
-        "\n".join(listing_text_entries).rstrip() + "\n",
-        encoding="utf-8",
-    )
 
     with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
