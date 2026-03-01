@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 import re
 import shutil
+import statistics
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,11 @@ try:
 except Exception:
     openai_module = None
 
+try:
+    import requests
+except Exception:
+    requests = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
@@ -42,6 +48,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = BASE_DIR / "cache"
 CACHE_FILE = CACHE_DIR / "hash.json"
 PROCESSED_INDEX_FILE = CACHE_DIR / "processed_index.json"
+PRICING_CACHE_FILE = CACHE_DIR / "pricing.json"
 ORIGINAL_HEIC_DIR = INPUT_DIR / "original_heic"
 
 PROCESSABLE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -50,6 +57,16 @@ ALLOWED_CONDITIONS = {"mint", "used", "cto", "unknown"}
 
 DEFAULT_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 MAX_FILENAME_LENGTH = 120
+PRICING_CACHE_TTL_DAYS = int(os.getenv("PRICING_CACHE_TTL_DAYS", "7"))
+ALLEGRO_API_BASE = os.getenv("ALLEGRO_API_BASE", "https://api.allegro.pl").rstrip("/")
+ALLEGRO_TOKEN_URL = os.getenv("ALLEGRO_TOKEN_URL", "https://allegro.pl/auth/oauth/token")
+ALLEGRO_LISTING_LIMIT = int(os.getenv("ALLEGRO_LISTING_LIMIT", "20"))
+CONDITION_PRICE_FACTOR = {
+    "mint": 1.12,
+    "used": 0.95,
+    "cto": 0.9,
+    "unknown": 0.85,
+}
 CSV_HEADERS_PL = [
     "nazwa_pliku",
     "tytul",
@@ -59,6 +76,11 @@ CSV_HEADERS_PL = [
     "stan",
     "pewnosc",
     "wymaga_weryfikacji",
+    "cena_sugerowana_pln",
+    "zakres_ceny_pln",
+    "zrodlo_ceny",
+    "pewnosc_ceny",
+    "wymaga_recznej_wyceny",
 ]
 
 TYPE_TO_PL = {
@@ -134,6 +156,8 @@ def ensure_directories() -> None:
         CACHE_FILE.write_text("{}", encoding="utf-8")
     if not PROCESSED_INDEX_FILE.exists():
         PROCESSED_INDEX_FILE.write_text("{}", encoding="utf-8")
+    if not PRICING_CACHE_FILE.exists():
+        PRICING_CACHE_FILE.write_text("{}", encoding="utf-8")
 
 
 def load_cache() -> dict[str, dict[str, Any]]:
@@ -190,6 +214,32 @@ def save_processed_index(processed_index: dict[str, dict[str, Any]]) -> None:
     tmp_file.replace(PROCESSED_INDEX_FILE)
 
 
+def load_pricing_cache() -> dict[str, dict[str, Any]]:
+    if not PRICING_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(PRICING_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        parsed: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                parsed[key] = value
+        return parsed
+    except Exception as exc:
+        print(f"Warning: failed to load pricing cache file {PRICING_CACHE_FILE.name}: {exc}")
+        return {}
+
+
+def save_pricing_cache(pricing_cache: dict[str, dict[str, Any]]) -> None:
+    tmp_file = PRICING_CACHE_FILE.with_suffix(".tmp")
+    tmp_file.write_text(
+        json.dumps(pricing_cache, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_file.replace(PRICING_CACHE_FILE)
+
+
 def sha1_of_file(path: Path) -> str:
     digest = hashlib.sha1()
     with path.open("rb") as handle:
@@ -217,7 +267,7 @@ def bool_value(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "y"}
+        return value.strip().lower() in {"true", "1", "yes", "y", "tak", "t"}
     return False
 
 
@@ -257,6 +307,257 @@ def to_string_list(value: Any) -> list[str]:
         if text:
             out.append(text)
     return out
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def to_pln(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", ".")
+    text = re.sub(r"[^0-9.]", "", text)
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def build_price_query(data: dict[str, Any]) -> str:
+    parts = [
+        str(data.get("country") or "").strip(),
+        str(data.get("era") or "").strip(),
+        str(data.get("year") or "").strip(),
+        str(data.get("topic") or data.get("series_name") or "").strip(),
+        str(TYPE_TO_PL.get(str(data.get("type") or "unknown"), "")).strip(),
+        "znaczek",
+    ]
+    normalized_parts = [p for p in parts if p]
+    query = " ".join(normalized_parts)
+    query = re.sub(r"\s+", " ", query).strip()
+    return query[:120]
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def price_cache_fresh(entry: dict[str, Any], ttl_days: int) -> bool:
+    created_at = parse_iso_datetime(entry.get("created_at"))
+    if created_at is None:
+        return False
+    age = datetime.now(timezone.utc) - created_at
+    return age.total_seconds() <= max(1, ttl_days) * 86400
+
+
+def extract_allegro_prices(payload: Any) -> list[float]:
+    prices: list[float] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            selling_mode = node.get("sellingMode")
+            if isinstance(selling_mode, dict):
+                price_obj = selling_mode.get("price")
+                if isinstance(price_obj, dict):
+                    currency = str(price_obj.get("currency") or "").upper().strip()
+                    amount = to_pln(price_obj.get("amount"))
+                    if currency == "PLN" and amount is not None and amount > 0:
+                        prices.append(amount)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    unique_sorted = sorted(set(round(x, 2) for x in prices))
+    return unique_sorted
+
+
+def get_allegro_access_token(token_state: dict[str, Any]) -> str | None:
+    cached_token = str(token_state.get("access_token") or "").strip()
+    expires_at = parse_iso_datetime(token_state.get("expires_at"))
+    if cached_token and expires_at is not None:
+        if (expires_at - datetime.now(timezone.utc)).total_seconds() > 30:
+            return cached_token
+
+    if requests is None:
+        return None
+
+    client_id = os.getenv("ALLEGRO_CLIENT_ID")
+    client_secret = os.getenv("ALLEGRO_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None
+
+    try:
+        response = requests.post(
+            ALLEGRO_TOKEN_URL,
+            params={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        if response.status_code >= 400:
+            print(
+                f"Warning: Allegro token request failed ({response.status_code}): {response.text[:240]}"
+            )
+            return None
+        payload = response.json()
+        token = str(payload.get("access_token") or "").strip()
+        expires_in = int(payload.get("expires_in") or 0)
+        if not token or expires_in <= 0:
+            return None
+        token_state["access_token"] = token
+        token_state["expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=max(30, expires_in - 30))
+        ).isoformat()
+        return token
+    except Exception as exc:
+        print(f"Warning: Allegro token request error: {exc}")
+        return None
+
+
+def fetch_allegro_market_prices(query: str, token_state: dict[str, Any]) -> tuple[list[float], str]:
+    if requests is None:
+        return ([], "brak_requests")
+    token = get_allegro_access_token(token_state)
+    if not token:
+        return ([], "brak_konfiguracji_allegro")
+
+    url = f"{ALLEGRO_API_BASE}/offers/listing"
+    params = {"phrase": query, "limit": max(5, min(ALLEGRO_LISTING_LIMIT, 60))}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.allegro.public.v1+json",
+    }
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+        if response.status_code >= 400:
+            print(
+                f"Warning: Allegro listing request failed ({response.status_code}): {response.text[:240]}"
+            )
+            if response.status_code == 403:
+                return ([], "allegro_brak_uprawnien_aplikacji")
+            return ([], "allegro_blad_api")
+        payload = response.json()
+        prices = extract_allegro_prices(payload)
+        if not prices:
+            return ([], "allegro_brak_ofert")
+        return (prices, "allegro_api")
+    except Exception as exc:
+        print(f"Warning: Allegro listing request error: {exc}")
+        return ([], "allegro_blad_sieci")
+
+
+def trimmed_prices(values: list[float]) -> list[float]:
+    ordered = sorted(values)
+    if len(ordered) < 10:
+        return ordered
+    trim_size = max(1, int(len(ordered) * 0.1))
+    if trim_size * 2 >= len(ordered):
+        return ordered
+    return ordered[trim_size:-trim_size]
+
+
+def format_price(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.2f}"
+
+
+def pricing_unavailable_result(source: str, query: str) -> dict[str, Any]:
+    return {
+        "cena_sugerowana_pln": "",
+        "zakres_ceny_pln": "",
+        "zrodlo_ceny": source,
+        "pewnosc_ceny": "0.00",
+        "wymaga_recznej_wyceny": True,
+        "liczba_ofert_cenowych": 0,
+        "zapytanie_cenowe": query,
+    }
+
+
+def compute_price_result(data: dict[str, Any], prices: list[float], source: str, query: str) -> dict[str, Any]:
+    if not prices:
+        return pricing_unavailable_result(source, query)
+
+    selected = trimmed_prices(prices)
+    if not selected:
+        return pricing_unavailable_result(source, query)
+
+    median_base = statistics.median(selected)
+    min_base = min(selected)
+    max_base = max(selected)
+
+    condition = str(data.get("condition") or "unknown")
+    confidence_model = to_float(data.get("confidence"), 0.0)
+    factor_condition = CONDITION_PRICE_FACTOR.get(condition, CONDITION_PRICE_FACTOR["unknown"])
+    factor_confidence = 0.85 + 0.15 * confidence_model
+    suggested = median_base * factor_condition * factor_confidence
+
+    low = max(0.01, min_base * factor_condition * 0.95)
+    high = max(low, max_base * factor_condition * 1.05)
+    confidence_price = min(
+        0.99,
+        0.45 + min(len(selected), 20) / 40.0 + confidence_model * 0.2,
+    )
+
+    return {
+        "cena_sugerowana_pln": format_price(suggested),
+        "zakres_ceny_pln": f"{low:.2f}-{high:.2f}",
+        "zrodlo_ceny": source,
+        "pewnosc_ceny": f"{confidence_price:.2f}",
+        "wymaga_recznej_wyceny": False,
+        "liczba_ofert_cenowych": len(selected),
+        "zapytanie_cenowe": query,
+    }
+
+
+def get_price_suggestion(
+    data: dict[str, Any],
+    pricing_cache: dict[str, dict[str, Any]],
+    token_state: dict[str, Any],
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    query = build_price_query(data)
+    if not query:
+        return pricing_unavailable_result("brak_zapytania", "")
+
+    cache_key = hashlib.sha1(query.encode("utf-8")).hexdigest()
+    cached_entry = pricing_cache.get(cache_key)
+    if (
+        not force_refresh
+        and isinstance(cached_entry, dict)
+        and price_cache_fresh(cached_entry, PRICING_CACHE_TTL_DAYS)
+    ):
+        cached_result = cached_entry.get("result")
+        if isinstance(cached_result, dict):
+            return cached_result
+
+    prices, source = fetch_allegro_market_prices(query, token_state)
+    result = compute_price_result(data, prices, source, query)
+    pricing_cache[cache_key] = {
+        "created_at": now_utc_iso(),
+        "query": query,
+        "result": result,
+    }
+    return result
 
 
 def normalize_response(data: dict[str, Any]) -> dict[str, Any]:
@@ -517,7 +818,11 @@ def make_unique_path(candidate: Path, current_path: Path) -> Path:
         counter += 1
 
 
-def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
+def format_listing_entry(
+    filename: str,
+    data: dict[str, Any],
+    pricing: dict[str, Any],
+) -> str:
     tags = ", ".join(data.get("tags") or [])
     confidence = to_float(data.get("confidence"), 0.0)
     review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
@@ -525,6 +830,11 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
     condition = CONDITION_TO_PL.get(
         str(data.get("condition") or "unknown"), "nieznany"
     )
+    price_value = str(pricing.get("cena_sugerowana_pln") or "")
+    price_range = str(pricing.get("zakres_ceny_pln") or "")
+    price_source = str(pricing.get("zrodlo_ceny") or "")
+    price_confidence = str(pricing.get("pewnosc_ceny") or "0.00")
+    manual_price = "tak" if bool_value(pricing.get("wymaga_recznej_wyceny")) else "nie"
 
     lines = [
         f"=== {filename} ===",
@@ -550,6 +860,21 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
         "WYMAGA_WERYFIKACJI:",
         "tak" if review else "nie",
         "",
+        "CENA_SUGEROWANA_PLN:",
+        price_value,
+        "",
+        "ZAKRES_CENY_PLN:",
+        price_range,
+        "",
+        "ZRODLO_CENY:",
+        price_source,
+        "",
+        "PEWNOSC_CENY:",
+        price_confidence,
+        "",
+        "WYMAGA_RECZNEJ_WYCENY:",
+        manual_price,
+        "",
     ]
     return "\n".join(lines)
 
@@ -559,7 +884,15 @@ def flatten_text(text: str) -> str:
 
 
 def failed_listing_entry(filename: str) -> str:
-    return f"=== {filename} ===\n\nNIEPOWODZENIE\n"
+    return (
+        f"=== {filename} ===\n\n"
+        "NIEPOWODZENIE\n\n"
+        "CENA_SUGEROWANA_PLN:\n\n\n"
+        "ZAKRES_CENY_PLN:\n\n\n"
+        "ZRODLO_CENY:\nbrak\n\n"
+        "PEWNOSC_CENY:\n0.00\n\n"
+        "WYMAGA_RECZNEJ_WYCENY:\ntak\n"
+    )
 
 
 def failed_csv_row(filename: str) -> dict[str, str]:
@@ -572,10 +905,19 @@ def failed_csv_row(filename: str) -> dict[str, str]:
         "stan": "nieznany",
         "pewnosc": "0.00",
         "wymaga_weryfikacji": "tak",
+        "cena_sugerowana_pln": "",
+        "zakres_ceny_pln": "",
+        "zrodlo_ceny": "brak",
+        "pewnosc_ceny": "0.00",
+        "wymaga_recznej_wyceny": "tak",
     }
 
 
-def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
+def success_csv_row(
+    filename: str,
+    data: dict[str, Any],
+    pricing: dict[str, Any],
+) -> dict[str, str]:
     confidence = to_float(data.get("confidence"), 0.0)
     needs_review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
     return {
@@ -587,6 +929,13 @@ def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
         "stan": CONDITION_TO_PL.get(str(data.get("condition") or "unknown"), "nieznany"),
         "pewnosc": f"{confidence:.2f}",
         "wymaga_weryfikacji": "tak" if needs_review else "nie",
+        "cena_sugerowana_pln": str(pricing.get("cena_sugerowana_pln") or ""),
+        "zakres_ceny_pln": str(pricing.get("zakres_ceny_pln") or ""),
+        "zrodlo_ceny": str(pricing.get("zrodlo_ceny") or ""),
+        "pewnosc_ceny": str(pricing.get("pewnosc_ceny") or "0.00"),
+        "wymaga_recznej_wyceny": "tak"
+        if bool_value(pricing.get("wymaga_recznej_wyceny"))
+        else "nie",
     }
 
 
@@ -613,6 +962,16 @@ def build_cli_args() -> argparse.Namespace:
         "--no-skip-processed",
         action="store_true",
         help="Nie pomijaj rekordow done i zawsze analizuj ponownie.",
+    )
+    parser.add_argument(
+        "--pricing-force-refresh",
+        action="store_true",
+        help="Pomin cache cen i pobierz ceny internetowe ponownie.",
+    )
+    parser.add_argument(
+        "--no-online-pricing",
+        action="store_true",
+        help="Wylacz pobieranie cen z internetu i ustaw tylko flage recznej wyceny.",
     )
     return parser.parse_args()
 
@@ -682,8 +1041,10 @@ def process_images(args: argparse.Namespace) -> int:
 
     cache = load_cache()
     processed_index = load_processed_index()
+    pricing_cache = load_pricing_cache()
     client = get_openai_client()
     model = DEFAULT_MODEL
+    allegro_token_state: dict[str, Any] = {}
 
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -706,6 +1067,17 @@ def process_images(args: argparse.Namespace) -> int:
         return 0
 
     csv_rows: list[dict[str, str]] = []
+
+    def resolve_price(data: dict[str, Any]) -> dict[str, Any]:
+        query = build_price_query(data)
+        if args.no_online_pricing:
+            return pricing_unavailable_result("wylaczone", query)
+        return get_price_suggestion(
+            data=data,
+            pricing_cache=pricing_cache,
+            token_state=allegro_token_state,
+            force_refresh=args.pricing_force_refresh,
+        )
 
     for image_path in input_files:
         print(f"Processing {image_path.name}")
@@ -744,9 +1116,10 @@ def process_images(args: argparse.Namespace) -> int:
                             print(f"-> renamed to {final_path.name}")
                         except Exception as exc:
                             print(f"Error renaming {image_path.name}: {exc}")
-                    listing_entry = format_listing_entry(final_path.name, data)
+                    pricing = resolve_price(data)
+                    listing_entry = format_listing_entry(final_path.name, data, pricing)
                     write_stamp_output(final_path, listing_entry)
-                    csv_rows.append(success_csv_row(final_path.name, data))
+                    csv_rows.append(success_csv_row(final_path.name, data, pricing))
                     upsert_processed_record(
                         processed_index=processed_index,
                         file_hash=file_hash,
@@ -783,9 +1156,10 @@ def process_images(args: argparse.Namespace) -> int:
                             print(f"-> renamed to {final_path.name}")
                         except Exception as exc:
                             print(f"Error renaming {image_path.name}: {exc}")
-                    listing_entry = format_listing_entry(final_path.name, data)
+                    pricing = resolve_price(data)
+                    listing_entry = format_listing_entry(final_path.name, data, pricing)
                     write_stamp_output(final_path, listing_entry)
-                    csv_rows.append(success_csv_row(final_path.name, data))
+                    csv_rows.append(success_csv_row(final_path.name, data, pricing))
                     upsert_processed_record(
                         processed_index=processed_index,
                         file_hash=file_hash,
@@ -868,9 +1242,10 @@ def process_images(args: argparse.Namespace) -> int:
         else:
             print(f"-> filename unchanged: {final_path.name}")
 
-        listing_entry = format_listing_entry(final_path.name, data)
+        pricing = resolve_price(data)
+        listing_entry = format_listing_entry(final_path.name, data, pricing)
         write_stamp_output(final_path, listing_entry)
-        csv_rows.append(success_csv_row(final_path.name, data))
+        csv_rows.append(success_csv_row(final_path.name, data, pricing))
         upsert_processed_record(
             processed_index=processed_index,
             file_hash=file_hash,
@@ -886,6 +1261,7 @@ def process_images(args: argparse.Namespace) -> int:
 
     save_cache(cache)
     save_processed_index(processed_index)
+    save_pricing_cache(pricing_cache)
     print(f"Done. Processed {len(input_files)} files.")
     return 0
 
