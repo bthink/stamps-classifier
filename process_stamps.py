@@ -53,6 +53,10 @@ ALLOWED_CONDITIONS = {"mint", "used", "cto", "unknown"}
 DEFAULT_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 DEFAULT_DETECTION_MODEL = os.getenv("OPENAI_DETECTION_MODEL", DEFAULT_MODEL)
 MAX_FILENAME_LENGTH = 120
+DETECTION_PADDING_RATIO = float(os.getenv("DETECTION_PADDING_RATIO", "0.35"))
+MIN_DETECTED_DIM_RATIO = float(os.getenv("MIN_DETECTED_DIM_RATIO", "0.16"))
+MIN_DETECTED_AREA_RATIO = float(os.getenv("MIN_DETECTED_AREA_RATIO", "0.015"))
+DETECTION_CACHE_VERSION = 2
 CSV_HEADERS_PL = [
     "nazwa_pliku",
     "zrodlo_obrazu",
@@ -845,6 +849,45 @@ def clamp_pixel_box(
     return (x, y, w, h)
 
 
+def expand_box_with_padding(
+    box: tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+    padding_ratio: float,
+) -> tuple[int, int, int, int] | None:
+    x, y, w, h = box
+    pad_x = int(round(w * max(0.0, padding_ratio)))
+    pad_y = int(round(h * max(0.0, padding_ratio)))
+    expanded = clamp_pixel_box(
+        x - pad_x,
+        y - pad_y,
+        w + 2 * pad_x,
+        h + 2 * pad_y,
+        image_width,
+        image_height,
+    )
+    if expanded is None:
+        return None
+
+    ex, ey, ew, eh = expanded
+    min_w = max(80, int(round(image_width * max(0.05, MIN_DETECTED_DIM_RATIO))))
+    min_h = max(80, int(round(image_height * max(0.05, MIN_DETECTED_DIM_RATIO))))
+    if ew < min_w or eh < min_h:
+        cx = ex + ew // 2
+        cy = ey + eh // 2
+        target_w = max(ew, min_w)
+        target_h = max(eh, min_h)
+        expanded = clamp_pixel_box(
+            cx - target_w // 2,
+            cy - target_h // 2,
+            target_w,
+            target_h,
+            image_width,
+            image_height,
+        )
+    return expanded
+
+
 def bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -873,6 +916,7 @@ def normalize_boxes(
     image_height: int,
 ) -> list[tuple[int, int, int, int]]:
     out: list[tuple[int, int, int, int]] = []
+    total_area = max(1, image_width * image_height)
     for region in normalized_regions:
         x = int(round(to_float(region.get("x"), 0.0) * image_width))
         y = int(round(to_float(region.get("y"), 0.0) * image_height))
@@ -881,10 +925,19 @@ def normalize_boxes(
         clamped = clamp_pixel_box(x, y, w, h, image_width, image_height)
         if clamped is None:
             continue
-        _, _, cw, ch = clamped
-        if cw < 80 or ch < 80:
+        expanded = expand_box_with_padding(
+            clamped,
+            image_width,
+            image_height,
+            DETECTION_PADDING_RATIO,
+        )
+        if expanded is None:
             continue
-        out.append(clamped)
+        _, _, cw, ch = expanded
+        area_ratio = (cw * ch) / total_area
+        if area_ratio < max(0.001, MIN_DETECTED_AREA_RATIO):
+            continue
+        out.append(expanded)
     out.sort(key=lambda b: (b[1], b[0]))
 
     deduped: list[tuple[int, int, int, int]] = []
@@ -908,24 +961,32 @@ def detect_stamp_boxes(
     detection_cache: dict[str, dict[str, Any]],
     detection_model: str,
     single_stamp_only: bool,
+    force_refresh: bool = False,
 ) -> list[tuple[int, int, int, int]]:
     if single_stamp_only:
         return fallback_single_box(source_path)
 
-    cached = detection_cache.get(source_hash)
-    if isinstance(cached, dict):
-        cached_boxes = cached.get("boxes")
-        if isinstance(cached_boxes, list):
-            parsed: list[tuple[int, int, int, int]] = []
-            for item in cached_boxes:
-                if (
-                    isinstance(item, list)
-                    and len(item) == 4
-                    and all(isinstance(x, int) for x in item)
-                ):
-                    parsed.append((item[0], item[1], item[2], item[3]))
-            if parsed:
-                return parsed
+    if not force_refresh:
+        cached = detection_cache.get(source_hash)
+        if isinstance(cached, dict):
+            cached_version = int(cached.get("version") or 0)
+            cached_source = str(cached.get("source") or "").strip()
+            cached_boxes = cached.get("boxes")
+            if (
+                cached_version >= DETECTION_CACHE_VERSION
+                and cached_source != "fallback_detection_error"
+                and isinstance(cached_boxes, list)
+            ):
+                parsed: list[tuple[int, int, int, int]] = []
+                for item in cached_boxes:
+                    if (
+                        isinstance(item, list)
+                        and len(item) == 4
+                        and all(isinstance(x, int) for x in item)
+                    ):
+                        parsed.append((item[0], item[1], item[2], item[3]))
+                if parsed:
+                    return parsed
 
     if client is None:
         boxes = fallback_single_box(source_path)
@@ -933,6 +994,7 @@ def detect_stamp_boxes(
             "boxes": [list(b) for b in boxes],
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": "fallback_no_client",
+            "version": DETECTION_CACHE_VERSION,
         }
         return boxes
 
@@ -950,6 +1012,7 @@ def detect_stamp_boxes(
             "boxes": [list(b) for b in boxes],
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": source,
+            "version": DETECTION_CACHE_VERSION,
         }
         return boxes
     except Exception as exc:
@@ -959,6 +1022,7 @@ def detect_stamp_boxes(
             "boxes": [list(b) for b in boxes],
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": "fallback_detection_error",
+            "version": DETECTION_CACHE_VERSION,
         }
         return boxes
 
@@ -1078,6 +1142,7 @@ def process_images(args: argparse.Namespace) -> int:
             detection_cache=detection_cache,
             detection_model=detection_model,
             single_stamp_only=args.single_stamp_only,
+            force_refresh=args.force,
         )
         candidates = build_stamp_candidates(source_path, source_hash, boxes)
         if len(candidates) > 1:
