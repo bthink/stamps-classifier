@@ -47,6 +47,32 @@ ALLOWED_CONDITIONS = {"mint", "used", "cto", "unknown"}
 
 DEFAULT_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 MAX_FILENAME_LENGTH = 120
+CSV_HEADERS_PL = [
+    "nazwa_pliku",
+    "tytul",
+    "opis",
+    "tagi",
+    "typ",
+    "stan",
+    "pewnosc",
+    "wymaga_weryfikacji",
+]
+
+TYPE_TO_PL = {
+    "single": "pojedynczy",
+    "series": "seria",
+    "block": "blok",
+    "sheet": "arkusz",
+    "fdc": "koperta_fdc",
+    "unknown": "nieznany",
+}
+
+CONDITION_TO_PL = {
+    "mint": "czysty",
+    "used": "kasowany",
+    "cto": "cto",
+    "unknown": "nieznany",
+}
 
 MODEL_PROMPT = """You analyze a photo of a postage stamp and produce data for an Allegro listing.
 
@@ -462,6 +488,10 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
     tags = ", ".join(data.get("tags") or [])
     confidence = to_float(data.get("confidence"), 0.0)
     review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
+    stype = TYPE_TO_PL.get(str(data.get("type") or "unknown"), "nieznany")
+    condition = CONDITION_TO_PL.get(
+        str(data.get("condition") or "unknown"), "nieznany"
+    )
 
     lines = [
         f"=== {filename} ===",
@@ -475,17 +505,17 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
         "TAGI:",
         tags,
         "",
-        "TYPE:",
-        str(data.get("type") or "unknown"),
+        "TYP:",
+        stype,
         "",
-        "CONDITION:",
-        str(data.get("condition") or "unknown"),
+        "STAN:",
+        condition,
         "",
-        "CONFIDENCE:",
+        "PEWNOSC:",
         f"{confidence:.2f}",
         "",
-        "REVIEW:",
-        "true" if review else "false",
+        "WYMAGA_WERYFIKACJI:",
+        "tak" if review else "nie",
         "",
     ]
     return "\n".join(lines)
@@ -493,6 +523,38 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
 
 def flatten_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
+
+
+def failed_listing_entry(filename: str) -> str:
+    return f"=== {filename} ===\n\nNIEPOWODZENIE\n"
+
+
+def failed_csv_row(filename: str) -> dict[str, str]:
+    return {
+        "nazwa_pliku": filename,
+        "tytul": "NIEPOWODZENIE",
+        "opis": "Nie udalo sie sklasyfikowac znaczka.",
+        "tagi": "",
+        "typ": "nieznany",
+        "stan": "nieznany",
+        "pewnosc": "0.00",
+        "wymaga_weryfikacji": "tak",
+    }
+
+
+def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
+    confidence = to_float(data.get("confidence"), 0.0)
+    needs_review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
+    return {
+        "nazwa_pliku": filename,
+        "tytul": str(data.get("title_pl") or ""),
+        "opis": flatten_text(str(data.get("description_pl") or "")),
+        "tagi": ", ".join(data.get("tags") or []),
+        "typ": TYPE_TO_PL.get(str(data.get("type") or "unknown"), "nieznany"),
+        "stan": CONDITION_TO_PL.get(str(data.get("condition") or "unknown"), "nieznany"),
+        "pewnosc": f"{confidence:.2f}",
+        "wymaga_weryfikacji": "tak" if needs_review else "nie",
+    }
 
 
 def process_images() -> int:
@@ -520,19 +582,7 @@ def process_images() -> int:
         print("No files to process in stamps/input/")
         (OUTPUT_DIR / "listings.txt").write_text("", encoding="utf-8")
         with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=[
-                    "filename",
-                    "title",
-                    "description",
-                    "tags",
-                    "type",
-                    "condition",
-                    "confidence",
-                    "needs_manual_review",
-                ],
-            )
+            writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
             writer.writeheader()
         return 0
 
@@ -545,38 +595,16 @@ def process_images() -> int:
             file_hash = sha1_of_file(image_path)
         except Exception as exc:
             print(f"Error hashing file {image_path.name}: {exc}")
-            listing_text_entries.append(f"=== {image_path.name} ===\n\nFAILED\n")
-            csv_rows.append(
-                {
-                    "filename": image_path.name,
-                    "title": "FAILED",
-                    "description": "FAILED",
-                    "tags": "",
-                    "type": "unknown",
-                    "condition": "unknown",
-                    "confidence": "0.00",
-                    "needs_manual_review": "true",
-                }
-            )
+            listing_text_entries.append(failed_listing_entry(image_path.name))
+            csv_rows.append(failed_csv_row(image_path.name))
             continue
 
         data = cache.get(file_hash)
         if data is None:
             if client is None:
                 print(f"Error: cannot analyze {image_path.name} without OpenAI client and cache.")
-                listing_text_entries.append(f"=== {image_path.name} ===\n\nFAILED\n")
-                csv_rows.append(
-                    {
-                        "filename": image_path.name,
-                        "title": "FAILED",
-                        "description": "FAILED",
-                        "tags": "",
-                        "type": "unknown",
-                        "condition": "unknown",
-                        "confidence": "0.00",
-                        "needs_manual_review": "true",
-                    }
-                )
+                listing_text_entries.append(failed_listing_entry(image_path.name))
+                csv_rows.append(failed_csv_row(image_path.name))
                 continue
 
             try:
@@ -584,38 +612,16 @@ def process_images() -> int:
                 cache[file_hash] = data
             except Exception as exc:
                 print(f"Error analyzing {image_path.name}: {exc}")
-                listing_text_entries.append(f"=== {image_path.name} ===\n\nFAILED\n")
-                csv_rows.append(
-                    {
-                        "filename": image_path.name,
-                        "title": "FAILED",
-                        "description": "FAILED",
-                        "tags": "",
-                        "type": "unknown",
-                        "condition": "unknown",
-                        "confidence": "0.00",
-                        "needs_manual_review": "true",
-                    }
-                )
+                listing_text_entries.append(failed_listing_entry(image_path.name))
+                csv_rows.append(failed_csv_row(image_path.name))
                 continue
         else:
             data = normalize_response(data)
 
         if not is_recognized(data):
             print(f"-> FAILED recognition for {image_path.name}")
-            listing_text_entries.append(f"=== {image_path.name} ===\n\nFAILED\n")
-            csv_rows.append(
-                {
-                    "filename": image_path.name,
-                    "title": "FAILED",
-                    "description": "FAILED",
-                    "tags": ", ".join(data.get("tags") or []),
-                    "type": str(data.get("type") or "unknown"),
-                    "condition": str(data.get("condition") or "unknown"),
-                    "confidence": f"{to_float(data.get('confidence'), 0.0):.2f}",
-                    "needs_manual_review": "true",
-                }
-            )
+            listing_text_entries.append(failed_listing_entry(image_path.name))
+            csv_rows.append(failed_csv_row(image_path.name))
             continue
 
         target_filename = build_target_filename(image_path, data, file_hash)
@@ -634,21 +640,7 @@ def process_images() -> int:
             print(f"-> filename unchanged: {final_path.name}")
 
         listing_text_entries.append(format_listing_entry(final_path.name, data))
-        csv_rows.append(
-            {
-                "filename": final_path.name,
-                "title": str(data.get("title_pl") or ""),
-                "description": flatten_text(str(data.get("description_pl") or "")),
-                "tags": ", ".join(data.get("tags") or []),
-                "type": str(data.get("type") or "unknown"),
-                "condition": str(data.get("condition") or "unknown"),
-                "confidence": f"{to_float(data.get('confidence'), 0.0):.2f}",
-                "needs_manual_review": "true"
-                if bool_value(data.get("needs_manual_review"))
-                or to_float(data.get("confidence"), 0.0) < 0.7
-                else "false",
-            }
-        )
+        csv_rows.append(success_csv_row(final_path.name, data))
 
     (OUTPUT_DIR / "listings.txt").write_text(
         "\n".join(listing_text_entries).rstrip() + "\n",
@@ -656,19 +648,7 @@ def process_images() -> int:
     )
 
     with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "filename",
-                "title",
-                "description",
-                "tags",
-                "type",
-                "condition",
-                "confidence",
-                "needs_manual_review",
-            ],
-        )
+        writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
         writer.writeheader()
         writer.writerows(csv_rows)
 
