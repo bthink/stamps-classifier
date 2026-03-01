@@ -42,16 +42,22 @@ OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = BASE_DIR / "cache"
 CACHE_FILE = CACHE_DIR / "hash.json"
 PROCESSED_INDEX_FILE = CACHE_DIR / "processed_index.json"
+DETECTION_CACHE_FILE = CACHE_DIR / "detection.json"
 ORIGINAL_HEIC_DIR = INPUT_DIR / "original_heic"
+CROPS_DIR = CACHE_DIR / "crops"
 
 PROCESSABLE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 ALLOWED_TYPES = {"single", "series", "block", "sheet", "fdc", "unknown"}
 ALLOWED_CONDITIONS = {"mint", "used", "cto", "unknown"}
 
 DEFAULT_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+DEFAULT_DETECTION_MODEL = os.getenv("OPENAI_DETECTION_MODEL", DEFAULT_MODEL)
 MAX_FILENAME_LENGTH = 120
 CSV_HEADERS_PL = [
     "nazwa_pliku",
+    "zrodlo_obrazu",
+    "indeks_znaczka",
+    "bbox",
     "tytul",
     "opis",
     "tagi",
@@ -125,15 +131,45 @@ Stored in album
 Combined shipping possible
 """
 
+DETECTION_PROMPT = """You detect all visible postage stamps on an image.
+
+Return JSON only, no markdown, no explanations.
+
+Expected JSON schema:
+{
+  "stamps": [
+    {
+      "x": number,
+      "y": number,
+      "w": number,
+      "h": number,
+      "confidence": number
+    }
+  ]
+}
+
+Rules:
+- Coordinates are normalized between 0 and 1.
+- x,y are top-left corner.
+- w,h are width and height.
+- Include every visible stamp.
+- Do not include album borders or empty spaces.
+- If there is only one stamp, return one bounding box.
+- If unsure, return empty array.
+"""
+
 
 def ensure_directories() -> None:
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CROPS_DIR.mkdir(parents=True, exist_ok=True)
     if not CACHE_FILE.exists():
         CACHE_FILE.write_text("{}", encoding="utf-8")
     if not PROCESSED_INDEX_FILE.exists():
         PROCESSED_INDEX_FILE.write_text("{}", encoding="utf-8")
+    if not DETECTION_CACHE_FILE.exists():
+        DETECTION_CACHE_FILE.write_text("{}", encoding="utf-8")
 
 
 def load_cache() -> dict[str, dict[str, Any]]:
@@ -188,6 +224,32 @@ def save_processed_index(processed_index: dict[str, dict[str, Any]]) -> None:
         encoding="utf-8",
     )
     tmp_file.replace(PROCESSED_INDEX_FILE)
+
+
+def load_detection_cache() -> dict[str, dict[str, Any]]:
+    if not DETECTION_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(DETECTION_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        parsed: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                parsed[key] = value
+        return parsed
+    except Exception as exc:
+        print(f"Warning: failed to load detection cache file {DETECTION_CACHE_FILE.name}: {exc}")
+        return {}
+
+
+def save_detection_cache(detection_cache: dict[str, dict[str, Any]]) -> None:
+    tmp_file = DETECTION_CACHE_FILE.with_suffix(".tmp")
+    tmp_file.write_text(
+        json.dumps(detection_cache, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_file.replace(DETECTION_CACHE_FILE)
 
 
 def sha1_of_file(path: Path) -> str:
@@ -401,6 +463,48 @@ def analyze_image(client: Any, image_path: Path, model: str) -> dict[str, Any]:
     return normalize_response(parse_json(raw_content))
 
 
+def analyze_stamp_regions(client: Any, image_path: Path, model: str) -> list[dict[str, Any]]:
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": DETECTION_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Detect stamps and return bounding boxes."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_to_data_url(image_path)},
+                    },
+                ],
+            },
+        ],
+    )
+    raw_content = response.choices[0].message.content or "{}"
+    payload = parse_json(raw_content)
+    raw_stamps = payload.get("stamps")
+    if not isinstance(raw_stamps, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_stamps:
+        if not isinstance(item, dict):
+            continue
+        x = to_float(item.get("x"), 0.0)
+        y = to_float(item.get("y"), 0.0)
+        w = to_float(item.get("w"), 0.0)
+        h = to_float(item.get("h"), 0.0)
+        conf = to_float(item.get("confidence"), 0.0)
+        if w <= 0.0 or h <= 0.0:
+            continue
+        out.append({"x": x, "y": y, "w": w, "h": h, "confidence": conf})
+    return out
+
+
 def convert_heic_files() -> None:
     heic_files = sorted(
         p for p in INPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".heic"
@@ -517,7 +621,20 @@ def make_unique_path(candidate: Path, current_path: Path) -> Path:
         counter += 1
 
 
-def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
+def bbox_to_text(bbox: tuple[int, int, int, int] | None) -> str:
+    if bbox is None:
+        return ""
+    x, y, w, h = bbox
+    return f"{x},{y},{w},{h}"
+
+
+def format_listing_entry(
+    filename: str,
+    data: dict[str, Any],
+    source_image: str | None = None,
+    crop_index: int | None = None,
+    crop_bbox: tuple[int, int, int, int] | None = None,
+) -> str:
     tags = ", ".join(data.get("tags") or [])
     confidence = to_float(data.get("confidence"), 0.0)
     review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
@@ -550,6 +667,15 @@ def format_listing_entry(filename: str, data: dict[str, Any]) -> str:
         "WYMAGA_WERYFIKACJI:",
         "tak" if review else "nie",
         "",
+        "ZRODLO_OBRAZU:",
+        str(source_image or ""),
+        "",
+        "INDEKS_ZNACZKA:",
+        str(crop_index or ""),
+        "",
+        "BBOX:",
+        bbox_to_text(crop_bbox),
+        "",
     ]
     return "\n".join(lines)
 
@@ -558,13 +684,32 @@ def flatten_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
 
 
-def failed_listing_entry(filename: str) -> str:
-    return f"=== {filename} ===\n\nNIEPOWODZENIE\n"
+def failed_listing_entry(
+    filename: str,
+    source_image: str | None = None,
+    crop_index: int | None = None,
+    crop_bbox: tuple[int, int, int, int] | None = None,
+) -> str:
+    return (
+        f"=== {filename} ===\n\n"
+        "NIEPOWODZENIE\n\n"
+        f"ZRODLO_OBRAZU:\n{source_image or ''}\n\n"
+        f"INDEKS_ZNACZKA:\n{crop_index or ''}\n\n"
+        f"BBOX:\n{bbox_to_text(crop_bbox)}\n"
+    )
 
 
-def failed_csv_row(filename: str) -> dict[str, str]:
+def failed_csv_row(
+    filename: str,
+    source_image: str | None = None,
+    crop_index: int | None = None,
+    crop_bbox: tuple[int, int, int, int] | None = None,
+) -> dict[str, str]:
     return {
         "nazwa_pliku": filename,
+        "zrodlo_obrazu": str(source_image or ""),
+        "indeks_znaczka": str(crop_index or ""),
+        "bbox": bbox_to_text(crop_bbox),
         "tytul": "NIEPOWODZENIE",
         "opis": "Nie udalo sie sklasyfikowac znaczka.",
         "tagi": "",
@@ -575,11 +720,20 @@ def failed_csv_row(filename: str) -> dict[str, str]:
     }
 
 
-def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
+def success_csv_row(
+    filename: str,
+    data: dict[str, Any],
+    source_image: str | None = None,
+    crop_index: int | None = None,
+    crop_bbox: tuple[int, int, int, int] | None = None,
+) -> dict[str, str]:
     confidence = to_float(data.get("confidence"), 0.0)
     needs_review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
     return {
         "nazwa_pliku": filename,
+        "zrodlo_obrazu": str(source_image or ""),
+        "indeks_znaczka": str(crop_index or ""),
+        "bbox": bbox_to_text(crop_bbox),
         "tytul": str(data.get("title_pl") or ""),
         "opis": flatten_text(str(data.get("description_pl") or "")),
         "tagi": ", ".join(data.get("tags") or []),
@@ -614,6 +768,11 @@ def build_cli_args() -> argparse.Namespace:
         action="store_true",
         help="Nie pomijaj rekordow done i zawsze analizuj ponownie.",
     )
+    parser.add_argument(
+        "--single-stamp-only",
+        action="store_true",
+        help="Wylacz detekcje wielu znaczkow i analizuj cale zdjecie jako jeden znaczek.",
+    )
     return parser.parse_args()
 
 
@@ -629,10 +788,16 @@ def upsert_processed_record(
     source_filename: str,
     output_filename: str,
     status: str,
+    source_image: str | None = None,
+    crop_index: int | None = None,
+    crop_bbox: tuple[int, int, int, int] | None = None,
 ) -> None:
     processed_index[file_hash] = {
         "file_hash": file_hash,
         "filename": source_filename,
+        "source_image": source_image or source_filename,
+        "crop_index": crop_index or 1,
+        "crop_bbox": bbox_to_text(crop_bbox),
         "output_filename": output_filename,
         "status": status,
         "processed_at": datetime.now(timezone.utc).isoformat(),
@@ -657,9 +822,194 @@ def prepare_output_stamp_dirs() -> None:
             shutil.rmtree(item, ignore_errors=True)
 
 
-def write_stamp_output(image_path: Path, listing_text: str) -> None:
+def prepare_crops_dir() -> None:
+    if CROPS_DIR.exists():
+        shutil.rmtree(CROPS_DIR, ignore_errors=True)
+    CROPS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clamp_pixel_box(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    x = max(0, min(x, max(0, width - 1)))
+    y = max(0, min(y, max(0, height - 1)))
+    w = max(1, min(w, width - x))
+    h = max(1, min(h, height - y))
+    if w <= 1 or h <= 1:
+        return None
+    return (x, y, w, h)
+
+
+def bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2 = ax + aw
+    ay2 = ay + ah
+    bx2 = bx + bw
+    by2 = by + bh
+    inter_x1 = max(ax, bx)
+    inter_y1 = max(ay, by)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def normalize_boxes(
+    normalized_regions: list[dict[str, Any]],
+    image_width: int,
+    image_height: int,
+) -> list[tuple[int, int, int, int]]:
+    out: list[tuple[int, int, int, int]] = []
+    for region in normalized_regions:
+        x = int(round(to_float(region.get("x"), 0.0) * image_width))
+        y = int(round(to_float(region.get("y"), 0.0) * image_height))
+        w = int(round(to_float(region.get("w"), 0.0) * image_width))
+        h = int(round(to_float(region.get("h"), 0.0) * image_height))
+        clamped = clamp_pixel_box(x, y, w, h, image_width, image_height)
+        if clamped is None:
+            continue
+        _, _, cw, ch = clamped
+        if cw < 80 or ch < 80:
+            continue
+        out.append(clamped)
+    out.sort(key=lambda b: (b[1], b[0]))
+
+    deduped: list[tuple[int, int, int, int]] = []
+    for candidate in out:
+        if any(bbox_iou(candidate, existing) > 0.85 for existing in deduped):
+            continue
+        deduped.append(candidate)
+    return deduped
+
+
+def fallback_single_box(source_path: Path) -> list[tuple[int, int, int, int]]:
+    with Image.open(source_path) as image:
+        width, height = image.size
+    return [(0, 0, max(1, width), max(1, height))]
+
+
+def detect_stamp_boxes(
+    source_path: Path,
+    source_hash: str,
+    client: Any | None,
+    detection_cache: dict[str, dict[str, Any]],
+    detection_model: str,
+    single_stamp_only: bool,
+) -> list[tuple[int, int, int, int]]:
+    if single_stamp_only:
+        return fallback_single_box(source_path)
+
+    cached = detection_cache.get(source_hash)
+    if isinstance(cached, dict):
+        cached_boxes = cached.get("boxes")
+        if isinstance(cached_boxes, list):
+            parsed: list[tuple[int, int, int, int]] = []
+            for item in cached_boxes:
+                if (
+                    isinstance(item, list)
+                    and len(item) == 4
+                    and all(isinstance(x, int) for x in item)
+                ):
+                    parsed.append((item[0], item[1], item[2], item[3]))
+            if parsed:
+                return parsed
+
+    if client is None:
+        boxes = fallback_single_box(source_path)
+        detection_cache[source_hash] = {
+            "boxes": [list(b) for b in boxes],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": "fallback_no_client",
+        }
+        return boxes
+
     try:
-        folder_base = safe_ascii(image_path.stem, fallback="znaczek")
+        with Image.open(source_path) as image:
+            width, height = image.size
+        detected = analyze_stamp_regions(client, source_path, detection_model)
+        boxes = normalize_boxes(detected, width, height)
+        if not boxes:
+            boxes = fallback_single_box(source_path)
+            source = "fallback_empty_detection"
+        else:
+            source = "openai_detection"
+        detection_cache[source_hash] = {
+            "boxes": [list(b) for b in boxes],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+        }
+        return boxes
+    except Exception as exc:
+        print(f"Warning: detection failed for {source_path.name}: {exc}")
+        boxes = fallback_single_box(source_path)
+        detection_cache[source_hash] = {
+            "boxes": [list(b) for b in boxes],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": "fallback_detection_error",
+        }
+        return boxes
+
+
+def build_stamp_candidates(
+    source_path: Path,
+    source_hash: str,
+    boxes: list[tuple[int, int, int, int]],
+) -> list[dict[str, Any]]:
+    if len(boxes) <= 1:
+        bbox = boxes[0] if boxes else None
+        return [
+            {
+                "analysis_path": source_path,
+                "source_image": source_path.name,
+                "crop_index": 1,
+                "crop_bbox": bbox,
+                "is_multi": False,
+            }
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    with Image.open(source_path) as image:
+        for index, (x, y, w, h) in enumerate(boxes, start=1):
+            crop = image.crop((x, y, x + w, y + h)).convert("RGB")
+            crop_name = (
+                f"{safe_ascii(source_path.stem, fallback='source')}"
+                f"__s{index:02d}_{source_hash[:8]}.jpg"
+            )
+            crop_path = CROPS_DIR / crop_name
+            crop.save(crop_path, format="JPEG", quality=95)
+            candidates.append(
+                {
+                    "analysis_path": crop_path,
+                    "source_image": source_path.name,
+                    "crop_index": index,
+                    "crop_bbox": (x, y, w, h),
+                    "is_multi": True,
+                }
+            )
+    return candidates
+
+
+def write_stamp_output(
+    image_path: Path,
+    listing_text: str,
+    output_image_name: str | None = None,
+) -> None:
+    try:
+        image_name = output_image_name or image_path.name
+        folder_base = safe_ascii(Path(image_name).stem, fallback="znaczek")
         counter = 2
         target_dir = OUTPUT_DIR / folder_base
         while True:
@@ -670,7 +1020,7 @@ def write_stamp_output(image_path: Path, listing_text: str) -> None:
                 target_dir = OUTPUT_DIR / f"{folder_base}_{counter}"
                 counter += 1
         (target_dir / "opis.txt").write_text(listing_text, encoding="utf-8")
-        shutil.copy2(image_path, target_dir / image_path.name)
+        shutil.copy2(image_path, target_dir / image_name)
     except Exception as exc:
         print(f"Error writing output package for {image_path.name}: {exc}")
 
@@ -679,11 +1029,14 @@ def process_images(args: argparse.Namespace) -> int:
     ensure_directories()
     convert_heic_files()
     prepare_output_stamp_dirs()
+    prepare_crops_dir()
 
     cache = load_cache()
     processed_index = load_processed_index()
+    detection_cache = load_detection_cache()
     client = get_openai_client()
     model = DEFAULT_MODEL
+    detection_model = DEFAULT_DETECTION_MODEL
 
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -707,177 +1060,421 @@ def process_images(args: argparse.Namespace) -> int:
 
     csv_rows: list[dict[str, str]] = []
 
-    for image_path in input_files:
-        print(f"Processing {image_path.name}")
+    for source_path in input_files:
+        print(f"Processing {source_path.name}")
         try:
-            file_hash = sha1_of_file(image_path)
+            source_hash = sha1_of_file(source_path)
         except Exception as exc:
-            print(f"Error hashing file {image_path.name}: {exc}")
-            failed_entry = failed_listing_entry(image_path.name)
-            write_stamp_output(image_path, failed_entry)
-            csv_rows.append(failed_csv_row(image_path.name))
+            print(f"Error hashing file {source_path.name}: {exc}")
+            failed_entry = failed_listing_entry(source_path.name, source_path.name, 1, None)
+            write_stamp_output(source_path, failed_entry, output_image_name=source_path.name)
+            csv_rows.append(failed_csv_row(source_path.name, source_path.name, 1, None))
             continue
 
-        indexed_record = processed_index.get(file_hash, {})
-        existing_status = str(indexed_record.get("status") or "").strip().lower()
-        if existing_status and not should_retry_by_status(existing_status, args):
-            if existing_status == "done":
-                print(f"Skipping {image_path.name} (already processed)")
-                cached_data = cache.get(file_hash)
-                if cached_data is None:
-                    print(
-                        f"Warning: missing cache for skipped file {image_path.name}, marking as failed."
-                    )
-                    failed_entry = failed_listing_entry(image_path.name)
-                    write_stamp_output(image_path, failed_entry)
-                    csv_rows.append(failed_csv_row(image_path.name))
-                else:
-                    data = normalize_response(cached_data)
-                    target_filename = build_target_filename(image_path, data, file_hash)
-                    target_path = INPUT_DIR / target_filename
-                    target_path = make_unique_path(target_path, image_path)
-                    final_path = image_path
-                    if target_path != image_path:
-                        try:
-                            image_path.rename(target_path)
-                            final_path = target_path
-                            print(f"-> renamed to {final_path.name}")
-                        except Exception as exc:
-                            print(f"Error renaming {image_path.name}: {exc}")
-                    listing_entry = format_listing_entry(final_path.name, data)
-                    write_stamp_output(final_path, listing_entry)
-                    csv_rows.append(success_csv_row(final_path.name, data))
-                    upsert_processed_record(
-                        processed_index=processed_index,
-                        file_hash=file_hash,
-                        source_filename=image_path.name,
-                        output_filename=final_path.name,
-                        status=processed_status(data),
-                    )
-                continue
+        boxes = detect_stamp_boxes(
+            source_path=source_path,
+            source_hash=source_hash,
+            client=client,
+            detection_cache=detection_cache,
+            detection_model=detection_model,
+            single_stamp_only=args.single_stamp_only,
+        )
+        candidates = build_stamp_candidates(source_path, source_hash, boxes)
+        if len(candidates) > 1:
+            print(f"-> detected {len(candidates)} stamp regions")
 
-            if existing_status == "failed":
-                print(f"Skipping {image_path.name} (failed before, use --retry-failed)")
-                failed_entry = failed_listing_entry(image_path.name)
-                write_stamp_output(image_path, failed_entry)
-                csv_rows.append(failed_csv_row(image_path.name))
-                continue
-
-            if existing_status == "review":
-                print(f"Skipping {image_path.name} (review before, use --recheck-review)")
-                cached_data = cache.get(file_hash)
-                if cached_data is None:
-                    failed_entry = failed_listing_entry(image_path.name)
-                    write_stamp_output(image_path, failed_entry)
-                    csv_rows.append(failed_csv_row(image_path.name))
-                else:
-                    data = normalize_response(cached_data)
-                    target_filename = build_target_filename(image_path, data, file_hash)
-                    target_path = INPUT_DIR / target_filename
-                    target_path = make_unique_path(target_path, image_path)
-                    final_path = image_path
-                    if target_path != image_path:
-                        try:
-                            image_path.rename(target_path)
-                            final_path = target_path
-                            print(f"-> renamed to {final_path.name}")
-                        except Exception as exc:
-                            print(f"Error renaming {image_path.name}: {exc}")
-                    listing_entry = format_listing_entry(final_path.name, data)
-                    write_stamp_output(final_path, listing_entry)
-                    csv_rows.append(success_csv_row(final_path.name, data))
-                    upsert_processed_record(
-                        processed_index=processed_index,
-                        file_hash=file_hash,
-                        source_filename=image_path.name,
-                        output_filename=final_path.name,
-                        status=processed_status(data),
-                    )
-                continue
-
-        if args.force:
-            print(f"Reprocessing {image_path.name} (force)")
-        elif existing_status == "failed" and args.retry_failed:
-            print(f"Reprocessing {image_path.name} (retry failed)")
-        elif existing_status == "review" and args.recheck_review:
-            print(f"Reprocessing {image_path.name} (recheck review)")
-        elif existing_status == "done" and args.no_skip_processed:
-            print(f"Reprocessing {image_path.name} (no skip processed)")
-
-        data = cache.get(file_hash)
-        if data is None:
-            if client is None:
-                print(f"Error: cannot analyze {image_path.name} without OpenAI client and cache.")
-                failed_entry = failed_listing_entry(image_path.name)
-                write_stamp_output(image_path, failed_entry)
-                csv_rows.append(failed_csv_row(image_path.name))
-                upsert_processed_record(
-                    processed_index=processed_index,
-                    file_hash=file_hash,
-                    source_filename=image_path.name,
-                    output_filename=image_path.name,
-                    status="failed",
-                )
-                continue
+        for candidate in candidates:
+            analysis_path = candidate["analysis_path"]
+            source_image = str(candidate["source_image"])
+            crop_index = int(candidate["crop_index"])
+            crop_bbox = candidate.get("crop_bbox")
+            is_multi = bool(candidate.get("is_multi"))
+            candidate_name = analysis_path.name
 
             try:
-                data = analyze_image(client, image_path, model)
-                cache[file_hash] = data
+                file_hash = sha1_of_file(analysis_path)
             except Exception as exc:
-                print(f"Error analyzing {image_path.name}: {exc}")
-                failed_entry = failed_listing_entry(image_path.name)
-                write_stamp_output(image_path, failed_entry)
-                csv_rows.append(failed_csv_row(image_path.name))
+                print(f"Error hashing file {candidate_name}: {exc}")
+                failed_entry = failed_listing_entry(
+                    candidate_name,
+                    source_image,
+                    crop_index,
+                    crop_bbox,
+                )
+                write_stamp_output(
+                    analysis_path,
+                    failed_entry,
+                    output_image_name=candidate_name,
+                )
+                csv_rows.append(
+                    failed_csv_row(
+                        candidate_name,
+                        source_image,
+                        crop_index,
+                        crop_bbox,
+                    )
+                )
+                continue
+
+            indexed_record = processed_index.get(file_hash, {})
+            existing_status = str(indexed_record.get("status") or "").strip().lower()
+            if existing_status and not should_retry_by_status(existing_status, args):
+                if existing_status == "done":
+                    print(f"Skipping {candidate_name} (already processed)")
+                    cached_data = cache.get(file_hash)
+                    if cached_data is None:
+                        print(
+                            f"Warning: missing cache for skipped file {candidate_name}, marking as failed."
+                        )
+                        failed_entry = failed_listing_entry(
+                            candidate_name,
+                            source_image,
+                            crop_index,
+                            crop_bbox,
+                        )
+                        write_stamp_output(
+                            analysis_path,
+                            failed_entry,
+                            output_image_name=candidate_name,
+                        )
+                        csv_rows.append(
+                            failed_csv_row(
+                                candidate_name,
+                                source_image,
+                                crop_index,
+                                crop_bbox,
+                            )
+                        )
+                    else:
+                        data = normalize_response(cached_data)
+                        if is_multi:
+                            output_filename = build_target_filename(
+                                analysis_path, data, file_hash
+                            )
+                            output_source_path = analysis_path
+                        else:
+                            target_filename = build_target_filename(
+                                source_path, data, file_hash
+                            )
+                            target_path = INPUT_DIR / target_filename
+                            target_path = make_unique_path(target_path, source_path)
+                            output_source_path = source_path
+                            output_filename = source_path.name
+                            if target_path != source_path:
+                                try:
+                                    source_path.rename(target_path)
+                                    output_source_path = target_path
+                                    output_filename = target_path.name
+                                    source_path = target_path
+                                    print(f"-> renamed to {output_filename}")
+                                except Exception as exc:
+                                    print(f"Error renaming {source_path.name}: {exc}")
+
+                        listing_entry = format_listing_entry(
+                            output_filename,
+                            data,
+                            source_image=source_image,
+                            crop_index=crop_index,
+                            crop_bbox=crop_bbox,
+                        )
+                        write_stamp_output(
+                            output_source_path,
+                            listing_entry,
+                            output_image_name=output_filename,
+                        )
+                        csv_rows.append(
+                            success_csv_row(
+                                output_filename,
+                                data,
+                                source_image=source_image,
+                                crop_index=crop_index,
+                                crop_bbox=crop_bbox,
+                            )
+                        )
+                        upsert_processed_record(
+                            processed_index=processed_index,
+                            file_hash=file_hash,
+                            source_filename=analysis_path.name,
+                            source_image=source_image,
+                            crop_index=crop_index,
+                            crop_bbox=crop_bbox,
+                            output_filename=output_filename,
+                            status=processed_status(data),
+                        )
+                    continue
+
+                if existing_status == "failed":
+                    print(f"Skipping {candidate_name} (failed before, use --retry-failed)")
+                    failed_entry = failed_listing_entry(
+                        candidate_name,
+                        source_image,
+                        crop_index,
+                        crop_bbox,
+                    )
+                    write_stamp_output(
+                        analysis_path,
+                        failed_entry,
+                        output_image_name=candidate_name,
+                    )
+                    csv_rows.append(
+                        failed_csv_row(
+                            candidate_name,
+                            source_image,
+                            crop_index,
+                            crop_bbox,
+                        )
+                    )
+                    continue
+
+                if existing_status == "review":
+                    print(f"Skipping {candidate_name} (review before, use --recheck-review)")
+                    cached_data = cache.get(file_hash)
+                    if cached_data is None:
+                        failed_entry = failed_listing_entry(
+                            candidate_name,
+                            source_image,
+                            crop_index,
+                            crop_bbox,
+                        )
+                        write_stamp_output(
+                            analysis_path,
+                            failed_entry,
+                            output_image_name=candidate_name,
+                        )
+                        csv_rows.append(
+                            failed_csv_row(
+                                candidate_name,
+                                source_image,
+                                crop_index,
+                                crop_bbox,
+                            )
+                        )
+                    else:
+                        data = normalize_response(cached_data)
+                        if is_multi:
+                            output_filename = build_target_filename(
+                                analysis_path, data, file_hash
+                            )
+                            output_source_path = analysis_path
+                        else:
+                            target_filename = build_target_filename(
+                                source_path, data, file_hash
+                            )
+                            target_path = INPUT_DIR / target_filename
+                            target_path = make_unique_path(target_path, source_path)
+                            output_source_path = source_path
+                            output_filename = source_path.name
+                            if target_path != source_path:
+                                try:
+                                    source_path.rename(target_path)
+                                    output_source_path = target_path
+                                    output_filename = target_path.name
+                                    source_path = target_path
+                                    print(f"-> renamed to {output_filename}")
+                                except Exception as exc:
+                                    print(f"Error renaming {source_path.name}: {exc}")
+
+                        listing_entry = format_listing_entry(
+                            output_filename,
+                            data,
+                            source_image=source_image,
+                            crop_index=crop_index,
+                            crop_bbox=crop_bbox,
+                        )
+                        write_stamp_output(
+                            output_source_path,
+                            listing_entry,
+                            output_image_name=output_filename,
+                        )
+                        csv_rows.append(
+                            success_csv_row(
+                                output_filename,
+                                data,
+                                source_image=source_image,
+                                crop_index=crop_index,
+                                crop_bbox=crop_bbox,
+                            )
+                        )
+                        upsert_processed_record(
+                            processed_index=processed_index,
+                            file_hash=file_hash,
+                            source_filename=analysis_path.name,
+                            source_image=source_image,
+                            crop_index=crop_index,
+                            crop_bbox=crop_bbox,
+                            output_filename=output_filename,
+                            status=processed_status(data),
+                        )
+                    continue
+
+            if args.force:
+                print(f"Reprocessing {candidate_name} (force)")
+            elif existing_status == "failed" and args.retry_failed:
+                print(f"Reprocessing {candidate_name} (retry failed)")
+            elif existing_status == "review" and args.recheck_review:
+                print(f"Reprocessing {candidate_name} (recheck review)")
+            elif existing_status == "done" and args.no_skip_processed:
+                print(f"Reprocessing {candidate_name} (no skip processed)")
+
+            data = cache.get(file_hash)
+            if data is None:
+                if client is None:
+                    print(f"Error: cannot analyze {candidate_name} without OpenAI client and cache.")
+                    failed_entry = failed_listing_entry(
+                        candidate_name,
+                        source_image,
+                        crop_index,
+                        crop_bbox,
+                    )
+                    write_stamp_output(
+                        analysis_path,
+                        failed_entry,
+                        output_image_name=candidate_name,
+                    )
+                    csv_rows.append(
+                        failed_csv_row(
+                            candidate_name,
+                            source_image,
+                            crop_index,
+                            crop_bbox,
+                        )
+                    )
+                    upsert_processed_record(
+                        processed_index=processed_index,
+                        file_hash=file_hash,
+                        source_filename=analysis_path.name,
+                        source_image=source_image,
+                        crop_index=crop_index,
+                        crop_bbox=crop_bbox,
+                        output_filename=candidate_name,
+                        status="failed",
+                    )
+                    continue
+
+                try:
+                    data = analyze_image(client, analysis_path, model)
+                    cache[file_hash] = data
+                except Exception as exc:
+                    print(f"Error analyzing {candidate_name}: {exc}")
+                    failed_entry = failed_listing_entry(
+                        candidate_name,
+                        source_image,
+                        crop_index,
+                        crop_bbox,
+                    )
+                    write_stamp_output(
+                        analysis_path,
+                        failed_entry,
+                        output_image_name=candidate_name,
+                    )
+                    csv_rows.append(
+                        failed_csv_row(
+                            candidate_name,
+                            source_image,
+                            crop_index,
+                            crop_bbox,
+                        )
+                    )
+                    upsert_processed_record(
+                        processed_index=processed_index,
+                        file_hash=file_hash,
+                        source_filename=analysis_path.name,
+                        source_image=source_image,
+                        crop_index=crop_index,
+                        crop_bbox=crop_bbox,
+                        output_filename=candidate_name,
+                        status="failed",
+                    )
+                    continue
+            else:
+                data = normalize_response(data)
+
+            if not is_recognized(data):
+                print(f"-> FAILED recognition for {candidate_name}")
+                failed_entry = failed_listing_entry(
+                    candidate_name,
+                    source_image,
+                    crop_index,
+                    crop_bbox,
+                )
+                write_stamp_output(
+                    analysis_path,
+                    failed_entry,
+                    output_image_name=candidate_name,
+                )
+                csv_rows.append(
+                    failed_csv_row(
+                        candidate_name,
+                        source_image,
+                        crop_index,
+                        crop_bbox,
+                    )
+                )
                 upsert_processed_record(
                     processed_index=processed_index,
                     file_hash=file_hash,
-                    source_filename=image_path.name,
-                    output_filename=image_path.name,
+                    source_filename=analysis_path.name,
+                    source_image=source_image,
+                    crop_index=crop_index,
+                    crop_bbox=crop_bbox,
+                    output_filename=candidate_name,
                     status="failed",
                 )
                 continue
-        else:
-            data = normalize_response(data)
 
-        if not is_recognized(data):
-            print(f"-> FAILED recognition for {image_path.name}")
-            failed_entry = failed_listing_entry(image_path.name)
-            write_stamp_output(image_path, failed_entry)
-            csv_rows.append(failed_csv_row(image_path.name))
+            if is_multi:
+                output_filename = build_target_filename(analysis_path, data, file_hash)
+                output_source_path = analysis_path
+                print(f"-> classified segment {crop_index} as {output_filename}")
+            else:
+                target_filename = build_target_filename(source_path, data, file_hash)
+                target_path = INPUT_DIR / target_filename
+                target_path = make_unique_path(target_path, source_path)
+                output_source_path = source_path
+                output_filename = source_path.name
+                if target_path != source_path:
+                    try:
+                        source_path.rename(target_path)
+                        output_source_path = target_path
+                        output_filename = target_path.name
+                        source_path = target_path
+                        print(f"-> renamed to {output_filename}")
+                    except Exception as exc:
+                        print(f"Error renaming {source_path.name}: {exc}")
+                else:
+                    print(f"-> filename unchanged: {output_filename}")
+
+            listing_entry = format_listing_entry(
+                output_filename,
+                data,
+                source_image=source_image,
+                crop_index=crop_index,
+                crop_bbox=crop_bbox,
+            )
+            write_stamp_output(
+                output_source_path,
+                listing_entry,
+                output_image_name=output_filename,
+            )
+            csv_rows.append(
+                success_csv_row(
+                    output_filename,
+                    data,
+                    source_image=source_image,
+                    crop_index=crop_index,
+                    crop_bbox=crop_bbox,
+                )
+            )
             upsert_processed_record(
                 processed_index=processed_index,
                 file_hash=file_hash,
-                source_filename=image_path.name,
-                output_filename=image_path.name,
-                status="failed",
+                source_filename=analysis_path.name,
+                source_image=source_image,
+                crop_index=crop_index,
+                crop_bbox=crop_bbox,
+                output_filename=output_filename,
+                status=processed_status(data),
             )
-            continue
-
-        target_filename = build_target_filename(image_path, data, file_hash)
-        target_path = INPUT_DIR / target_filename
-        target_path = make_unique_path(target_path, image_path)
-
-        final_path = image_path
-        if target_path != image_path:
-            try:
-                image_path.rename(target_path)
-                final_path = target_path
-                print(f"-> renamed to {final_path.name}")
-            except Exception as exc:
-                print(f"Error renaming {image_path.name}: {exc}")
-        else:
-            print(f"-> filename unchanged: {final_path.name}")
-
-        listing_entry = format_listing_entry(final_path.name, data)
-        write_stamp_output(final_path, listing_entry)
-        csv_rows.append(success_csv_row(final_path.name, data))
-        upsert_processed_record(
-            processed_index=processed_index,
-            file_hash=file_hash,
-            source_filename=image_path.name,
-            output_filename=final_path.name,
-            status=processed_status(data),
-        )
 
     with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
@@ -886,6 +1483,7 @@ def process_images(args: argparse.Namespace) -> int:
 
     save_cache(cache)
     save_processed_index(processed_index)
+    save_detection_cache(detection_cache)
     print(f"Done. Processed {len(input_files)} files.")
     return 0
 
