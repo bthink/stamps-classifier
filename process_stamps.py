@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import base64
 import csv
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = BASE_DIR / "cache"
 CACHE_FILE = CACHE_DIR / "hash.json"
+PROCESSED_INDEX_FILE = CACHE_DIR / "processed_index.json"
 ORIGINAL_HEIC_DIR = INPUT_DIR / "original_heic"
 
 PROCESSABLE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -129,6 +132,8 @@ def ensure_directories() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if not CACHE_FILE.exists():
         CACHE_FILE.write_text("{}", encoding="utf-8")
+    if not PROCESSED_INDEX_FILE.exists():
+        PROCESSED_INDEX_FILE.write_text("{}", encoding="utf-8")
 
 
 def load_cache() -> dict[str, dict[str, Any]]:
@@ -155,6 +160,34 @@ def save_cache(cache: dict[str, dict[str, Any]]) -> None:
         encoding="utf-8",
     )
     tmp_file.replace(CACHE_FILE)
+
+
+def load_processed_index() -> dict[str, dict[str, Any]]:
+    if not PROCESSED_INDEX_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(PROCESSED_INDEX_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        parsed: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                parsed[key] = value
+        return parsed
+    except Exception as exc:
+        print(
+            f"Warning: failed to load processed index file {PROCESSED_INDEX_FILE.name}: {exc}"
+        )
+        return {}
+
+
+def save_processed_index(processed_index: dict[str, dict[str, Any]]) -> None:
+    tmp_file = PROCESSED_INDEX_FILE.with_suffix(".tmp")
+    tmp_file.write_text(
+        json.dumps(processed_index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_file.replace(PROCESSED_INDEX_FILE)
 
 
 def sha1_of_file(path: Path) -> str:
@@ -557,6 +590,67 @@ def success_csv_row(filename: str, data: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def build_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Przetwarzanie zdjec znaczkow: analiza, rename, opisy i CSV."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Wymus pelne ponowne przetworzenie wszystkich zdjec.",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Ponow analize tylko dla rekordow oznaczonych jako failed.",
+    )
+    parser.add_argument(
+        "--recheck-review",
+        action="store_true",
+        help="Ponow analize tylko dla rekordow oznaczonych jako review.",
+    )
+    parser.add_argument(
+        "--no-skip-processed",
+        action="store_true",
+        help="Nie pomijaj rekordow done i zawsze analizuj ponownie.",
+    )
+    return parser.parse_args()
+
+
+def processed_status(data: dict[str, Any]) -> str:
+    confidence = to_float(data.get("confidence"), 0.0)
+    needs_review = bool_value(data.get("needs_manual_review")) or confidence < 0.7
+    return "review" if needs_review else "done"
+
+
+def upsert_processed_record(
+    processed_index: dict[str, dict[str, Any]],
+    file_hash: str,
+    source_filename: str,
+    output_filename: str,
+    status: str,
+) -> None:
+    processed_index[file_hash] = {
+        "file_hash": file_hash,
+        "filename": source_filename,
+        "output_filename": output_filename,
+        "status": status,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def should_retry_by_status(status: str, args: argparse.Namespace) -> bool:
+    if args.force:
+        return True
+    if status == "failed":
+        return args.retry_failed
+    if status == "review":
+        return args.recheck_review
+    if status == "done":
+        return args.no_skip_processed
+    return args.no_skip_processed
+
+
 def prepare_output_stamp_dirs() -> None:
     for item in OUTPUT_DIR.iterdir():
         if item.is_dir():
@@ -566,25 +660,28 @@ def prepare_output_stamp_dirs() -> None:
 def write_stamp_output(image_path: Path, listing_text: str) -> None:
     try:
         folder_base = safe_ascii(image_path.stem, fallback="znaczek")
-        target_dir = OUTPUT_DIR / folder_base
         counter = 2
-        while target_dir.exists():
-            target_dir = OUTPUT_DIR / f"{folder_base}_{counter}"
-            counter += 1
-
-        target_dir.mkdir(parents=True, exist_ok=False)
+        target_dir = OUTPUT_DIR / folder_base
+        while True:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                target_dir = OUTPUT_DIR / f"{folder_base}_{counter}"
+                counter += 1
         (target_dir / "opis.txt").write_text(listing_text, encoding="utf-8")
         shutil.copy2(image_path, target_dir / image_path.name)
     except Exception as exc:
         print(f"Error writing output package for {image_path.name}: {exc}")
 
 
-def process_images() -> int:
+def process_images(args: argparse.Namespace) -> int:
     ensure_directories()
     convert_heic_files()
     prepare_output_stamp_dirs()
 
     cache = load_cache()
+    processed_index = load_processed_index()
     client = get_openai_client()
     model = DEFAULT_MODEL
 
@@ -621,6 +718,92 @@ def process_images() -> int:
             csv_rows.append(failed_csv_row(image_path.name))
             continue
 
+        indexed_record = processed_index.get(file_hash, {})
+        existing_status = str(indexed_record.get("status") or "").strip().lower()
+        if existing_status and not should_retry_by_status(existing_status, args):
+            if existing_status == "done":
+                print(f"Skipping {image_path.name} (already processed)")
+                cached_data = cache.get(file_hash)
+                if cached_data is None:
+                    print(
+                        f"Warning: missing cache for skipped file {image_path.name}, marking as failed."
+                    )
+                    failed_entry = failed_listing_entry(image_path.name)
+                    write_stamp_output(image_path, failed_entry)
+                    csv_rows.append(failed_csv_row(image_path.name))
+                else:
+                    data = normalize_response(cached_data)
+                    target_filename = build_target_filename(image_path, data, file_hash)
+                    target_path = INPUT_DIR / target_filename
+                    target_path = make_unique_path(target_path, image_path)
+                    final_path = image_path
+                    if target_path != image_path:
+                        try:
+                            image_path.rename(target_path)
+                            final_path = target_path
+                            print(f"-> renamed to {final_path.name}")
+                        except Exception as exc:
+                            print(f"Error renaming {image_path.name}: {exc}")
+                    listing_entry = format_listing_entry(final_path.name, data)
+                    write_stamp_output(final_path, listing_entry)
+                    csv_rows.append(success_csv_row(final_path.name, data))
+                    upsert_processed_record(
+                        processed_index=processed_index,
+                        file_hash=file_hash,
+                        source_filename=image_path.name,
+                        output_filename=final_path.name,
+                        status=processed_status(data),
+                    )
+                continue
+
+            if existing_status == "failed":
+                print(f"Skipping {image_path.name} (failed before, use --retry-failed)")
+                failed_entry = failed_listing_entry(image_path.name)
+                write_stamp_output(image_path, failed_entry)
+                csv_rows.append(failed_csv_row(image_path.name))
+                continue
+
+            if existing_status == "review":
+                print(f"Skipping {image_path.name} (review before, use --recheck-review)")
+                cached_data = cache.get(file_hash)
+                if cached_data is None:
+                    failed_entry = failed_listing_entry(image_path.name)
+                    write_stamp_output(image_path, failed_entry)
+                    csv_rows.append(failed_csv_row(image_path.name))
+                else:
+                    data = normalize_response(cached_data)
+                    target_filename = build_target_filename(image_path, data, file_hash)
+                    target_path = INPUT_DIR / target_filename
+                    target_path = make_unique_path(target_path, image_path)
+                    final_path = image_path
+                    if target_path != image_path:
+                        try:
+                            image_path.rename(target_path)
+                            final_path = target_path
+                            print(f"-> renamed to {final_path.name}")
+                        except Exception as exc:
+                            print(f"Error renaming {image_path.name}: {exc}")
+                    listing_entry = format_listing_entry(final_path.name, data)
+                    write_stamp_output(final_path, listing_entry)
+                    csv_rows.append(success_csv_row(final_path.name, data))
+                    upsert_processed_record(
+                        processed_index=processed_index,
+                        file_hash=file_hash,
+                        source_filename=image_path.name,
+                        output_filename=final_path.name,
+                        status=processed_status(data),
+                    )
+                continue
+
+        if args.force:
+            print(f"Reprocessing {image_path.name} (force)")
+        elif existing_status == "failed" and args.retry_failed:
+            print(f"Reprocessing {image_path.name} (retry failed)")
+        elif existing_status == "review" and args.recheck_review:
+            print(f"Reprocessing {image_path.name} (recheck review)")
+        elif existing_status == "done" and args.no_skip_processed:
+            print(f"Reprocessing {image_path.name} (no skip processed)")
+
         data = cache.get(file_hash)
         if data is None:
             if client is None:
@@ -628,6 +811,13 @@ def process_images() -> int:
                 failed_entry = failed_listing_entry(image_path.name)
                 write_stamp_output(image_path, failed_entry)
                 csv_rows.append(failed_csv_row(image_path.name))
+                upsert_processed_record(
+                    processed_index=processed_index,
+                    file_hash=file_hash,
+                    source_filename=image_path.name,
+                    output_filename=image_path.name,
+                    status="failed",
+                )
                 continue
 
             try:
@@ -638,6 +828,13 @@ def process_images() -> int:
                 failed_entry = failed_listing_entry(image_path.name)
                 write_stamp_output(image_path, failed_entry)
                 csv_rows.append(failed_csv_row(image_path.name))
+                upsert_processed_record(
+                    processed_index=processed_index,
+                    file_hash=file_hash,
+                    source_filename=image_path.name,
+                    output_filename=image_path.name,
+                    status="failed",
+                )
                 continue
         else:
             data = normalize_response(data)
@@ -647,6 +844,13 @@ def process_images() -> int:
             failed_entry = failed_listing_entry(image_path.name)
             write_stamp_output(image_path, failed_entry)
             csv_rows.append(failed_csv_row(image_path.name))
+            upsert_processed_record(
+                processed_index=processed_index,
+                file_hash=file_hash,
+                source_filename=image_path.name,
+                output_filename=image_path.name,
+                status="failed",
+            )
             continue
 
         target_filename = build_target_filename(image_path, data, file_hash)
@@ -667,6 +871,13 @@ def process_images() -> int:
         listing_entry = format_listing_entry(final_path.name, data)
         write_stamp_output(final_path, listing_entry)
         csv_rows.append(success_csv_row(final_path.name, data))
+        upsert_processed_record(
+            processed_index=processed_index,
+            file_hash=file_hash,
+            source_filename=image_path.name,
+            output_filename=final_path.name,
+            status=processed_status(data),
+        )
 
     with (OUTPUT_DIR / "listings.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS_PL)
@@ -674,13 +885,15 @@ def process_images() -> int:
         writer.writerows(csv_rows)
 
     save_cache(cache)
+    save_processed_index(processed_index)
     print(f"Done. Processed {len(input_files)} files.")
     return 0
 
 
 def main() -> int:
     try:
-        return process_images()
+        args = build_cli_args()
+        return process_images(args)
     except Exception as exc:
         print(f"Fatal error: {exc}")
         return 1
